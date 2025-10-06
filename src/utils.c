@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/select.h>
+#include <time.h>              // ← añadido
 #include "session_handler.h"
 #include "protocol.h"
 #include "game_manager.h"
@@ -12,6 +13,16 @@
 
 #define PORT 8080
 #define MAX 1024
+
+// ===== Timestamp para logs (usado por session_handler/server_main) =====
+const char* get_timestamp(void) {
+    static char buf[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return buf;
+}
 
 // Función auxiliar para agregar un cliente a la lista de espera.
 void add_waiting_client(waiting_client_t **list, waiting_client_t *client) {
@@ -116,7 +127,9 @@ int setup_server_socket(FILE *log_file) {
     return sockfd;
 }
 
-// Manejo de la conexión de un cliente
+// ===== Rutas legacy del juego (NO usadas por el chat) =====
+
+// Manejo de la conexión de un cliente (legacy)
 void handle_client_connection(int client_sock, int client_id, struct sockaddr_in cli_addr,
                               waiting_client_t **waiting_list, rooms **rooms_list, FILE *log_file) {
     char message[MAX];
@@ -143,7 +156,6 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
         return;
     }
 
-    // Para el login: msg.game_id es el MatchID y msg.data es el username.
     int game_id = msg.game_id;
     char username[50];
     strncpy(username, msg.data, sizeof(username) - 1);
@@ -151,22 +163,16 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
 
     int turn;
 
-    // Buscar en la lista de salas si la sala con el game_id está ocupada.
     rooms *room = search_room(rooms_list, game_id, false);
     bool empty_room = true;
     if(room!=NULL){
         empty_room = false;
     }
 
-
-
-
     waiting_client_t *waiting = pop_waiting_client(waiting_list, game_id);
 
     if (empty_room) {
         if (waiting == NULL) {
-            // Primer cliente en la sala para este game_id.
-            // El turno que devuelve game_manager ya debería ser 1.
             turn = 1;
 
             snprintf(message, sizeof(message), "Cliente %d autenticado como %s en partida %d. (Turno: %d)\n", client_id, username, game_id, turn);
@@ -174,7 +180,6 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
             fflush(log_file);
             printf("%s", message);
             
-            // Agregar este cliente a la lista de espera.
             waiting_client_t *new_waiting = malloc(sizeof(waiting_client_t));
             if (!new_waiting) {
                 snprintf(message, sizeof(message), "Error al asignar memoria para cliente en espera");
@@ -197,11 +202,7 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
             fprintf(log_file, "%s\n", message);
             fflush(log_file);
             printf("%s", message);
-            
-
         } else {
-            // Se encontró un cliente esperando con el mismo game_id: este es el segundo.
-            // Para el segundo cliente, forzamos turno = 0.
             turn = 0;
             
             snprintf(message, sizeof(message), "Cliente %d autenticado como %s en partida %d. (Turno: %d)\n", client_id, username, game_id, turn);
@@ -209,7 +210,6 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
             fflush(log_file);
             printf("%s", message);
 
-            // Emparejar: el cliente que estaba en espera (primero) y este segundo cliente.
             create_session(waiting, client_sock, client_id, game_id, username, rooms_list, log_file);
         }
     } else {
@@ -228,12 +228,10 @@ void handle_client_connection(int client_sock, int client_id, struct sockaddr_in
         fprintf(log_file, "%s\n", message);
         fflush(log_file);
         printf("%s", message);
-
-            
     }
 }
 
-// Enviar ACK al cliente
+// Enviar ACK al cliente (legacy)
 void send_login_ack(int client_sock, ProtocolMessage *ackMsg, FILE *log_file) {
     char message[MAX];
     char formatted_ack[MAX];
@@ -242,9 +240,9 @@ void send_login_ack(int client_sock, ProtocolMessage *ackMsg, FILE *log_file) {
     fprintf(log_file, "%s\n", message);
     fflush(log_file);
     write(client_sock, formatted_ack, strlen(formatted_ack));
-    
 }
-// Crear una nueva sesión entre dos clientes
+
+// Crear una nueva sesión entre dos clientes (legacy)
 void create_session(waiting_client_t *waiting, int client_sock, int client_id, int game_id,
                     const char *username, rooms **rooms_list, FILE *log_file) {
     
@@ -262,7 +260,6 @@ void create_session(waiting_client_t *waiting, int client_sock, int client_id, i
     strncpy(username2, username, sizeof(username2));
     username2[sizeof(username2) - 1] = '\0';
     
-    //Agregar la sala a la lista de salas ocupadas
     rooms *new_room = malloc(sizeof(rooms));
     if (!new_room) {
         snprintf(message, sizeof(message), "Error al asignar memoria para la sala");
@@ -276,7 +273,6 @@ void create_session(waiting_client_t *waiting, int client_sock, int client_id, i
     new_room->next = NULL;
     add_room(rooms_list, new_room);
 
-    // Crear la sesión y asignar datos.
     session_pair_t *session = malloc(sizeof(session_pair_t));
     if (session == NULL) {
         snprintf(message, sizeof(message), "Error al asignar memoria para la sesión");
@@ -325,7 +321,7 @@ void create_session(waiting_client_t *waiting, int client_sock, int client_id, i
 
     session->room = rooms_list;
     session->log_file = log_file;
-    // Crear un hilo para manejar la sesión.
+
     pthread_t tid;
     if (pthread_create(&tid, NULL, session_handler, (void *)session) != 0) {
         snprintf(message, sizeof(message), "Error al crear el hilo de sesión");

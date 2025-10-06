@@ -4,25 +4,15 @@ Socket enlazado a puerto 8080.
 
 Server escuchando...
 
-Cliente 1 autenticado como johan en partida 1. (Turno: 1)
-
-Cliente 1 en espera para partida 1.
-
-Cliente 2 autenticado como juan en partida 1. (Turno: 0)
-
-Sesión creada entre Cliente 1 (johan) y Cliente 2 (juan) en partida 1.
-
-Enviando a johan: LOGGED|1|Ok|1|5,3,P;5,4,P;5,5,P;5,6,P;5,7,P;
-
-Iniciando sesión de chat entre johan y juan en partida 1...
-
-johan envía: ATTACK|1|0,0
-
-RESULT|1|NOHIT|0
-UPDATE|1|NOHIT|0,0|1
-juan envía: FF|1|
-
-juan Se rinde ante johan
-GAME_END|1|johan|
-Sesión de chat finalizada entre johan y juan en partida 1.
-
+2025-10-05 21:16:55 "Servidor de chat iniciado" - SERVER
+2025-10-05 21:17:41 "Sala 1 creada" - SERVER
+2025-10-05 21:18:09 "JOIN|1|sabogal" - sabogal
+2025-10-05 21:19:01 "JOIN|1|SARA" - SARA
+2025-10-05 21:19:10 "MSG|1|hols chachos" - SARA
+2025-10-05 21:19:19 "MSG|1|que pasa puta " - ALVERIO
+2025-10-05 21:19:31 "MSG|1|ey ey ey respetico pues con la niña" - sabogal
+2025-10-05 21:20:14 "Sala 2 creada" - SERVER
+2025-10-05 21:20:14 "JOIN|2|emmanuel" - emmanuel
+2025-10-05 21:20:30 "MSG|2|ey amor " - mariana
+2025-10-05 21:20:35 "MSG|2|ey mi vida" - emmanuel
+2025-10-05 21:20:49 "LEAVE|2|" - emmanuel

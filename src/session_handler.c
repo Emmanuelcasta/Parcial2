@@ -1,274 +1,251 @@
-#include <stdio.h>
+#include "session_handler.h"
+#include "protocol.h"
+#include "utils.h"      // get_timestamp, etc.
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/select.h>
-#include "session_handler.h"
-#include "protocol.h"
-#include "game_manager.h"
-#include "utils.h"
+#include <errno.h>
 
-#define MAX 1024
+/* ====== Infra de salas (chat multiusuario) ====== */
+static room_t *g_rooms = NULL;
+static pthread_mutex_t g_rooms_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-
-//Función para procesar mensajes de usuarios
-void process_messages(GameManager *gm, int sock1, int sock2, int game_id, const char* username1, const char* username2,  ProtocolMessage msg, int* end, FILE *log_file){
-        char message[1500];
-        // Se espera que msg.data contenga dos enteros "x,y"
-        int x, y;
-        *end = 0;
-        if (sscanf(msg.data, "%d,%d", &x, &y) != 2) {
-            printf("Error al parsear ATTACK de %s.\n", username1);
-        } else {
-            // Llamar al game_manager para procesar el ataque.
-            char attackerResp[256], enemyResp[256];
-            int decision;
-            game_manager_process_attack(gm, game_id, username1, username2, x, y,
-                                        attackerResp, sizeof(attackerResp),
-                                        enemyResp, sizeof(enemyResp),
-                                        &decision);
-                    
-            ProtocolMessage responseMsg;
-            char responseStr[MAX];
-
-            if (decision == 0 || decision == 1) { // Caso: Error (OutOfBounds o Ataque duplicado)
-                responseMsg.type = MSG_ERROR;
-                responseMsg.game_id = game_id;
-                strncpy(responseMsg.data, attackerResp, sizeof(responseMsg.data)-1);
-                responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-                write(sock1, responseStr, strlen(responseStr));
-
-                snprintf(message, sizeof(message), "%s", responseStr);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-            }
-
-            if (decision == 2) { // Ataque válido
-                responseMsg.type = MSG_RESULT;
-                responseMsg.game_id = game_id;
-                strncpy(responseMsg.data, attackerResp, sizeof(responseMsg.data)-1);
-                responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-                write(sock1, responseStr, strlen(responseStr));
-                snprintf(message, sizeof(message), "%s", responseStr);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-                        
-                // Enviar UPDATE al defensor.
-                responseMsg.type = MSG_UPDATE;
-                strncpy(responseMsg.data, enemyResp, sizeof(responseMsg.data)-1);
-                responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-                write(sock2, responseStr, strlen(responseStr));
-                snprintf(message, sizeof(message), "%s", responseStr);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-            }
-
-            if (decision == 3) { // Ataque decisivo (fin del juego)
-                responseMsg.type = MSG_END;
-                responseMsg.game_id = game_id;
-                strncpy(responseMsg.data, attackerResp, sizeof(responseMsg.data)-1);
-                responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-                write(sock1, responseStr, strlen(responseStr));
-                snprintf(message, sizeof(message), "%s", responseStr);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-                        
-                responseMsg.type = MSG_END;
-                strncpy(responseMsg.data, enemyResp, sizeof(responseMsg.data)-1);
-                responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-                write(sock2, responseStr, strlen(responseStr));
-                snprintf(message, sizeof(message), "%s", responseStr);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-                *end = 1;
-            }
-        }
+static void format_and_send(int fd, MessageType t, int room, const char* data) {
+    ProtocolMessage m = { .type = t, .game_id = room };
+    if (data) {
+        strncpy(m.data, data, sizeof(m.data)-1);
+        m.data[sizeof(m.data)-1] = '\0';
+    } else {
+        m.data[0] = '\0';
+    }
+    char out[MAX_LINE];
+    format_message(m, out, sizeof(out));
+    size_t len = strlen(out);
+    if (len < sizeof(out) - 1) { out[len] = '\n'; out[len+1] = '\0'; }
+    write(fd, out, strlen(out));
 }
 
-// Función de manejo de sesión: recibe mensajes de ambos clientes y, si se trata de un ataque, llama al game_manager.
-void *session_handler(void *arg) {
-    char message[1500];
-    session_pair_t *session = (session_pair_t *)arg;
-    FILE *log_file = session->log_file;
-    int sock1 = session->client_sock1; int sock2 = session->client_sock2;
-    int game_id = session->game_id;
-    char username1[50]; char username2[50];
-    strncpy(username1, session->username1, sizeof(username1));
-    username1[sizeof(username1)-1] = '\0';
-    strncpy(username2, session->username2, sizeof(username2));
-    username2[sizeof(username2)-1] = '\0';
-    GameManager *gm = session->gm;
-    rooms **rooms_list = session->room;
-    free(session);
+static room_t* find_room_nolock(int room_id) {
+    for (room_t *r = g_rooms; r; r = r->next)
+        if (r->room_id == room_id) return r;
+    return NULL;
+}
 
-    // Preparar el ACK usando el protocolo para tener el prefijo "LOGGED"
-    // El ACK tendrá el formato: "LOGGED|MatchID|Ok|<turn>|<initial_info>   
+void rooms_init(void) {
+    pthread_mutex_lock(&g_rooms_mtx);
+    g_rooms = NULL;
+    pthread_mutex_unlock(&g_rooms_mtx);
+}
 
-    ProtocolMessage ackMsg;
-    ackMsg.type = MSG_LOGGED;
-    ackMsg.game_id = game_id;
-    int turn1; int turn2;
-    char initial_info1[100]; char initial_info2[100];
-    char buf[MAX];
+static void remove_client_at(room_t *r, int idx) {
+    if (idx < 0 || idx >= r->num_clients) return;
+    int fd = r->clients[idx].fd;
+    if (fd >= 0) close(fd);
+    for (int i = idx; i < r->num_clients - 1; ++i)
+        r->clients[i] = r->clients[i+1];
+    r->num_clients--;
+}
 
-    game_manager_process_login(gm, game_id, username1, initial_info1, sizeof(initial_info1), &turn1);
-    turn1 = 1;
-    snprintf(buf,sizeof(buf),"Ok|%d|%s",turn1,initial_info1);
-    strncpy(ackMsg.data,buf,sizeof(ackMsg.data)-1); ackMsg.data[sizeof(ackMsg.data)-1]=0;
-    format_message(ackMsg,buf,MAX); write(sock1,buf,strlen(buf));
-    snprintf(message, sizeof(message), "Enviando a %s: %s\n",username1,buf);
-    fprintf(log_file, "%s\n", message);
-    fflush(log_file);
-    printf("%s", message);
+void try_close_room(room_t *r) {
+    if (r->num_clients > 0) return;
 
-    game_manager_process_login(gm, game_id, username2, initial_info2, sizeof(initial_info2), &turn2);
-    turn2 = 0;
-    snprintf(buf,sizeof(buf),"Ok|%d|%s",turn2,initial_info2);
-    strncpy(ackMsg.data,buf,sizeof(ackMsg.data)-1); ackMsg.data[sizeof(ackMsg.data)-1]=0;
-    format_message(ackMsg,buf,MAX); write(sock2,buf,strlen(buf));
-    snprintf(message, sizeof(message), "Iniciando sesión de chat entre %s y %s en partida %d...\n", username1, username2, game_id);
-    fprintf(log_file, "%s\n", message);
-    fflush(log_file);
-    printf("%s", message);
-    
-    // Bucle principal de la sesión.
-    while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sock1, &readfds);
-        FD_SET(sock2, &readfds);
-        char buff[MAX];
-        int n;
-        int max_sd = (sock1 > sock2) ? sock1 : sock2;
-        struct timeval timeout;
-        timeout.tv_sec = 30;
-        timeout.tv_usec = 0;
-        int end = 0;
+    pthread_mutex_lock(&g_rooms_mtx);
+    room_t **pp = &g_rooms;
+    while (*pp && *pp != r) pp = &((*pp)->next);
+    if (*pp == r) *pp = r->next;
+    pthread_mutex_unlock(&g_rooms_mtx);
 
-        int activity = select(max_sd + 1, &readfds, NULL, NULL, &timeout); //Se añade el timeout de 30 segundos
-        
-        if (activity < 0) { perror("select error"); break; }
-        if (activity == 0) {
-            snprintf(message, sizeof(message), "Timeout: ningún mensaje recibido en 30 segundos. Cambiando turno automáticamente.\n");
-            fprintf(log_file, "%s\n", message);
-            fflush(log_file);
-            printf("%s", message);
+    pthread_mutex_destroy(&r->mtx);
+    free(r);
+}
 
-            char attackerResp[10], enemyResp[10];
-            snprintf(attackerResp, sizeof(attackerResp), "-1");
-            snprintf(enemyResp, sizeof(enemyResp), "-1");
-            ProtocolMessage responseMsg;
-            char responseStr[MAX];
-            
+static void broadcast(room_t *r, int from_fd, const char *payload) {
+    for (int i = 0; i < r->num_clients; ++i) {
+        int fd = r->clients[i].fd;
+        if (fd == from_fd) continue;
+        format_and_send(fd, MSG_FROM, r->room_id, payload);
+    }
+}
 
-            responseMsg.type = MSG_TIMEOUT;
-            responseMsg.game_id = game_id;
-            strncpy(responseMsg.data, attackerResp, sizeof(responseMsg.data)-1);
-            responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-            format_message(responseMsg, responseStr, MAX);
-            write(sock1, responseStr, strlen(responseStr));
-            write(sock2, responseStr, strlen(responseStr));
+static void process_line(room_t *r, int idx, const char *line) {
+    client_info_t *cli = &r->clients[idx];
+    FILE *logf = r->log_file;
+
+    if (logf) { fprintf(logf, "%s \"%s\" - %s\n", get_timestamp(), line, cli->username); fflush(logf); }
+
+    ProtocolMessage msg;
+    if (!parse_message(line, &msg)) return;
+
+    if (msg.type == MSG_LEAVE || msg.type == MSG_FF) {
+        char sysmsg[256]; snprintf(sysmsg, sizeof(sysmsg), "%s salió del chat.", cli->username);
+        for (int j = 0; j < r->num_clients; ++j) {
+            if (j == idx) continue;
+            format_and_send(r->clients[j].fd, MSG_SYS, r->room_id, sysmsg);
+        }
+        remove_client_at(r, idx);
+        return;
+    } else if (msg.type == MSG_MSG) {
+        char payload[256];
+        snprintf(payload, sizeof(payload), "%s: %s", cli->username, msg.data);
+        broadcast(r, cli->fd, payload);
+    }
+}
+
+static void* room_thread(void *arg) {
+    room_t *r = (room_t*)arg;
+
+    pthread_mutex_lock(&r->mtx);
+    if (r->log_file) {
+        fprintf(r->log_file, "%s \"Sala %d creada\" - SERVER\n", get_timestamp(), r->room_id);
+        fflush(r->log_file);
+    }
+    pthread_mutex_unlock(&r->mtx);
+
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = -1;
+
+        pthread_mutex_lock(&r->mtx);
+        for (int i = 0; i < r->num_clients; ++i) {
+            int fd = r->clients[i].fd;
+            FD_SET(fd, &rfds);
+            if (fd > maxfd) maxfd = fd;
+        }
+        FILE *logf = r->log_file;
+        pthread_mutex_unlock(&r->mtx);
+
+        struct timeval tmo = { .tv_sec = 1, .tv_usec = 0 };
+        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tmo);
+        if (sel < 0) {
+            if (errno == EINTR) continue;
+            pthread_mutex_lock(&r->mtx);
+            if (logf) { fprintf(logf, "%s \"select error en sala %d\" - SERVER\n", get_timestamp(), r->room_id); fflush(logf); }
+            for (int i = r->num_clients - 1; i >= 0; --i) remove_client_at(r, i);
+            try_close_room(r);
+            pthread_mutex_unlock(&r->mtx);
+            return NULL;
+        }
+        if (sel == 0) {
+            pthread_mutex_lock(&r->mtx);
+            if (r->num_clients == 0) {
+                if (logf) { fprintf(logf, "%s \"Sala %d vacía -> cerrando\" - SERVER\n", get_timestamp(), r->room_id); fflush(logf); }
+                try_close_room(r);
+                pthread_mutex_unlock(&r->mtx);
+                return NULL;
+            }
+            pthread_mutex_unlock(&r->mtx);
             continue;
         }
-        // Procesar mensajes del primer cliente.
-        if (FD_ISSET(sock1, &readfds)) {
-            memset(buff, 0, MAX);
-            n = read(sock1, buff, MAX);
-            if (n <= 0) { printf("%s desconectado.\n", username1); break; }
-            snprintf(message, sizeof(message), "%s envía: %s", username1, buff);
-            fprintf(log_file, "%s\n", message);
-            fflush(log_file);
-            printf("%s", message);
-            
-            ProtocolMessage msg;
-            if (parse_message(buff, &msg) && msg.type == MSG_ATTACK) {
-                process_messages(gm, sock1, sock2, game_id, username1, username2, msg, &end, log_file);   
-                if(end==1){
-                    
-                    search_room(rooms_list, game_id, true);
-                    break;
+
+        pthread_mutex_lock(&r->mtx);
+        for (int i = 0; i < r->num_clients; /* ++i dentro */) {
+            int fd = r->clients[i].fd;
+            if (!FD_ISSET(fd, &rfds)) { i++; continue; }
+
+            char tmp[1024];
+            int n = read(fd, tmp, sizeof(tmp));
+            if (n <= 0) {
+                if (logf) { fprintf(logf, "%s \"LEAVE por desconexión: %s (sala %d)\" - SERVER\n", get_timestamp(), r->clients[i].username, r->room_id); fflush(logf); }
+                char sysmsg[256]; snprintf(sysmsg, sizeof(sysmsg), "%s salió del chat.", r->clients[i].username);
+                for (int j = 0; j < r->num_clients; ++j) {
+                    if (j == i) continue;
+                    format_and_send(r->clients[j].fd, MSG_SYS, r->room_id, sysmsg);
                 }
-            } else if(parse_message(buff, &msg) && msg.type == MSG_FF) {
-                ProtocolMessage responseMsg;
-                char responseStr[MAX];
+                remove_client_at(r, i);
+                continue;
+            }
 
-                responseMsg.type = MSG_END; responseMsg.game_id = game_id;
-                char winner[MAX]; snprintf(winner, sizeof(winner), "%s|", username2);
-                strncpy(responseMsg.data, winner, sizeof(responseMsg.data)-1); responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
+            client_info_t *cli = &r->clients[i];
+            if (n > INBUF_SIZE - cli->inlen - 1) n = INBUF_SIZE - cli->inlen - 1;
+            memcpy(cli->inbuf + cli->inlen, tmp, n);
+            cli->inlen += n;
+            cli->inbuf[cli->inlen] = '\0';
 
-                snprintf(message, sizeof(message), "%s Se rinde ante %s", username1, username2);
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-                
+            char *start = cli->inbuf;
+            for (;;) {
+                char *nl = strchr(start, '\n');
+                if (!nl) break;
+                *nl = '\0';
+                if (*start) process_line(r, i, start);
+                start = nl + 1;
+                if (i >= r->num_clients) break; // pudo salir del chat
+            }
 
-                write(sock2, responseStr, strlen(responseStr));
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-
-                end = 1;
-                search_room(rooms_list, game_id, true);
-            } else{
-                write(sock2, buff, n);
-            } 
+            if (i < r->num_clients) {
+                int rem = (int)(cli->inbuf + cli->inlen - start);
+                memmove(cli->inbuf, start, rem);
+                cli->inlen = rem;
+                cli->inbuf[cli->inlen] = '\0';
+                i++;
+            }
         }
-        
-        // Procesar mensajes del segundo cliente (lógica similar, roles invertidos).
-        if (FD_ISSET(sock2, &readfds)) {
-            memset(buff, 0, MAX);
-            n = read(sock2, buff, MAX);
-            if (n <= 0) { printf("%s desconectado.\n", username2); break; }
-            snprintf(message, sizeof(message), "%s envía: %s", username2, buff);
-            fprintf(log_file, "%s\n", message);
-            fflush(log_file);
-            printf("%s", message);
-            
-            ProtocolMessage msg;
-            if (parse_message(buff, &msg) && msg.type == MSG_ATTACK) {
-                process_messages(gm, sock2, sock1, game_id, username2, username1, msg, &end, log_file);
-                if(end==1){
-                    
-                    search_room(rooms_list, game_id, true);
-                    break;
-                }
-            } else if(parse_message(buff, &msg) && msg.type == MSG_FF) {
-                ProtocolMessage responseMsg;
-                char responseStr[MAX];
-
-                responseMsg.type = MSG_END; responseMsg.game_id = game_id;
-                char winner[MAX]; snprintf(winner, sizeof(winner), "%s|", username1);
-                strncpy(responseMsg.data, winner, sizeof(responseMsg.data)-1); responseMsg.data[sizeof(responseMsg.data)-1] = '\0';
-                format_message(responseMsg, responseStr, MAX);
-
-                snprintf(message, sizeof(message), "%s Se rinde ante %s", username2, username1);
-                
-                write(sock1, responseStr, strlen(responseStr));
-                write(sock2, responseStr, strlen(responseStr));
-                fprintf(log_file, "%s\n", message);
-                fflush(log_file);
-
-                fprintf(log_file, "%s\n", responseStr);
-                fflush(log_file);
-                
-                end = 1;
-                search_room(rooms_list, game_id, true);
-            } else{
-                write(sock1, buff, n);
-            } 
-        }
+        pthread_mutex_unlock(&r->mtx);
     }
-    
-    close(sock1);
-    close(sock2);
-    snprintf(message, sizeof(message), "Sesión de chat finalizada entre %s y %s en partida %d.\n", username1, username2, game_id);
-    search_room(rooms_list, game_id, true);   
-    fprintf(log_file, "%s\n", message);
-    fflush(log_file);
-    printf("%s", message);
+    return NULL;
+}
+
+void add_client_to_room(int client_fd, int room_id, const char* username, FILE *log_file) {
+    if (!username) username = "anon";
+
+    pthread_mutex_lock(&g_rooms_mtx);
+    room_t *r = find_room_nolock(room_id);
+    if (!r) {
+        r = (room_t*)calloc(1, sizeof(room_t));
+        r->room_id = room_id;
+        r->num_clients = 0;
+        r->log_file = log_file;
+        pthread_mutex_init(&r->mtx, NULL);
+        r->next = g_rooms;
+        g_rooms = r;
+        pthread_create(&r->thread, NULL, room_thread, r);
+        pthread_detach(r->thread);
+    }
+    pthread_mutex_unlock(&g_rooms_mtx);
+
+    pthread_mutex_lock(&r->mtx);
+    if (r->num_clients >= MAX_CLIENTS_PER_ROOM) {
+        const char *full = "SYS|0|Sala llena\n";
+        write(client_fd, full, strlen(full));
+        close(client_fd);
+        pthread_mutex_unlock(&r->mtx);
+        return;
+    }
+
+    client_info_t *cli = &r->clients[r->num_clients];
+    cli->fd = client_fd;
+    strncpy(cli->username, username, MAX_USERNAME_LEN-1);
+    cli->username[MAX_USERNAME_LEN-1] = '\0';
+    cli->alive = true;
+    cli->inlen = 0; cli->inbuf[0] = '\0';
+    r->num_clients++;
+
+    ProtocolMessage ack = { .type = MSG_LOGGED, .game_id = room_id };
+    snprintf(ack.data, sizeof(ack.data), "Ok|1|");
+    char out[MAX_LINE]; format_message(ack, out, sizeof(out));
+    size_t len = strlen(out);
+    if (len < sizeof(out) - 1) { out[len] = '\n'; out[len+1] = '\0'; }
+    write(client_fd, out, strlen(out));
+
+    char sysmsg[256];
+    snprintf(sysmsg, sizeof(sysmsg), "%s se unió al chat.", username);
+    for (int i = 0; i < r->num_clients - 1; ++i) {
+        format_and_send(r->clients[i].fd, MSG_SYS, room_id, sysmsg);
+    }
+    pthread_mutex_unlock(&r->mtx);
+}
+
+/* ====== DUMMY legacy ======
+ * utils.c llama pthread_create(..., session_handler, session)
+ * pero en modo chat NO usamos esa ruta. Definimos stub para enlazar.
+ */
+void *session_handler(void *arg) {
+    session_pair_t *s = (session_pair_t*)arg;
+    if (!s) return NULL;
+    if (s->client_sock1 > 0) close(s->client_sock1);
+    if (s->client_sock2 > 0) close(s->client_sock2);
+    free(s);
     return NULL;
 }

@@ -36,15 +36,18 @@ rooms* search_room(rooms **list, int game_id, bool remove);
 //Inicialización del socket del servidor
 int setup_server_socket(FILE *log_file);
 
-// Manejo de la conexión de un cliente
+// Manejo de la conexión de un cliente (ruta legacy del juego: NO usada en chat)
 void handle_client_connection(int client_sock, int client_id, struct sockaddr_in cli_addr,
                               waiting_client_t **waiting_list, rooms **rooms_list, FILE *log_file);
 
-// Enviar ACK al cliente
+// Enviar ACK al cliente (legacy del juego)
 void send_login_ack(int client_sock, ProtocolMessage *ackMsg, FILE *log_file);
 
-// Crear una nueva sesión entre dos clientes
+// Crear una nueva sesión entre dos clientes (legacy del juego)
 void create_session(waiting_client_t *waiting, int client_sock, int client_id, int game_id,
                     const char *username, rooms **rooms_list, FILE *log_file);
+
+// >>> Declaración para logs (implementada en utils.c)
+const char* get_timestamp(void);
 
 #endif 
