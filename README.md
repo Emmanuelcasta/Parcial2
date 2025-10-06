@@ -232,3 +232,6 @@ python3 -m src.chat_main
 
 **Log del cliente**
 - `transaction_log.txt` guarda los envíos/recepciones.
+
+**Refencias**
+- https://github.com/SebasUr/Battleship-Networking.git (Un proyecto anterior de telematica en el cual yo trabaje el semestre pasado y justo trabajamos el tema de la comunicacion por medio de hilos)
